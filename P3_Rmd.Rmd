@@ -1,0 +1,155 @@
+---
+title: "MRF - Projekt 3"
+author: "Filip Sass-Gustkiewicz"
+date: "2022-12-13"
+output: html_document
+---
+
+```{r include=FALSE}
+library(dplyr)
+library(lubridate)
+library(rugarch)
+library(ggplot2)
+
+alr_d = read.csv2("C:\\Users\\filip\\OneDrive\\Modelowanie Rynkow Finansowych\\Projekt3_Kowalczyk_SassGustkiewicz\\alr_d.csv", dec = ".", sep=",")
+intra = read.csv2("C:\\Users\\filip\\OneDrive\\Modelowanie Rynkow Finansowych\\Projekt3_Kowalczyk_SassGustkiewicz\\ALR_2_intraday_2017_2020.csv")
+
+
+
+```
+
+## Wprowadzenie 
+
+Z załączonego folderu intraday pobrano śróddzienne notowania akcji spółki Alior. Korzystając ze strony stooq.pl uzyskano dane dzienne tej spółki i tego samego okresu, będącego w przeprowadzanych badaniach czasem od 1 stycznia 2019 do 31 grudnia 2020 roku. Dane przefltrowano, wybrano interesujące nas w dalszych badaniach kolumny oraz obliczono 10 minutowe stopy zwrou przy pomocy wcześniej uprzednio funkcji. 
+
+
+```{r}
+log_rates <- function(x)
+{
+  lag = 1
+  x <- as.numeric(x)
+  res <- x[-c(1:lag)]/x[-c(length(x):(length(x) - lag + 1))]
+  
+  return(log(c(rep(NA, lag), res)))
+}
+
+overnight = filter(intra, intra$timestamp == "09:00:00")
+
+intra = filter(intra, intra$dzien >= date('2019-01-02'))
+intra = intra %>% select(timestamp,dzien,cena,stopa_5min, time) 
+intra = intra %>% mutate(timestamp=hms(as.character(timestamp))) # HMS Function as a constructor that accepts second, minute, hour and day components as numeric vectors.
+
+intra.10m = intra %>% filter(((minute(timestamp) %% 10 == 0) | (timestamp >= hms("17:00:00"))))
+intra.10m = intra.10m %>% mutate(stopa_10min = log_rates(cena)) %>% na.omit()
+intra.10m = intra.10m %>% mutate(st_kw = stopa_10min*stopa_10min)
+intra.10m = intra.10m %>% filter(timestamp>hms("9:00:00"))
+```
+
+## Zadanie 3 - Obliczenie wartości zmienności zrealizowanej
+
+Dla każdego z dni rozważanego okresu wyznaczono wartości zmienności zrealizowanej $\sigma_{3,t}^2$  wyznaczonej na podstawie 10-minutowych stóp zwrotu. Zmienność zrealizowaną obliczono na podstawie wzoru wykorzystującego iloraz wariancji stopy zwrotu pomiędzy kursem z zamknięcia, a kursem z otwarcia następnego dnia i wariancji zwrotu dziennego. Stopy z godziny 9:00 potraktowao jako stopę overnight i usunięto je z danych.
+
+```{r}
+alr_d = alr_d %>% mutate(oc = log(Close/Open))
+c = (var(overnight$stopa_5min))/(var(alr_d$oc))
+dates = unique(intra.10m$dzien)
+
+sigma = data.frame(dates,temp=NA,sigma_rates=NA)
+
+for (i in 1:length(dates)){
+  sigma$temp[i] = (1+c)*sum(filter(intra.10m, intra.10m$dzien == dates[i])$st_kw)
+}
+
+for (i in 2:length(dates)){
+  sigma$sigma_rates[i] = sigma[i-1,2]
+} 
+
+sigma=sigma[,-2]
+```
+
+## Zadanie 4.a - Estymacja modelu AR(1)-GARCH(1,1) 
+
+Celem stworzenia modeli wykorzystywanych są do prognozowania zmienności zrealizowanej zbudowano model AR(1)- GARCH(1,1). Wyznaczono logarytmiczne stopy zwrotu z akcji dla pierwszych 6 miesięcy danych z opóźnioną o jeden dzień wartością dziennej zmienności zrealizowanej jako dodatkową zmienną objaśniającą w równaniu warunkowej wariancji. 
+
+```{r}
+alr_d$log_rates = NA
+
+for (i in 2:nrow(alr_d)) {
+  alr_d$log_rates[i] = log(alr_d$Close[i]/alr_d$Close[i-1])
+}
+alr_d$log_rates[1] = 0
+
+alr_d_6m = filter(alr_d, alr_d$Date<=date('2019-07-02')) 
+sigma_6m = filter(sigma, sigma$dates<=date('2019-07-02'))
+
+garch_spec = ugarchspec(variance.model = list(model = "sGARCH", garchOrder = c(1, 1),external.regressors = matrix(sigma_6m[-1,2])), mean.model = list(armaOrder = c(1, 0)), distribution.model = "norm")
+
+garch_fit_4b = ugarchfit(spec=garch_spec, data=matrix(alr_d_6m$log_rates[2:125]), solver = "hybrid")
+
+```
+
+## Zadanie 4.b - Prognoza
+
+Kolejno, wyznaczono prognozę warunkowej wartości oczekiwanej dziennej stopy zwrotu oraz jej warunkowej wariancji na jeden dzień do przodu.
+
+```{r}
+forecast_4b = ugarchforecast(data = alr_d_6m$log_rates,fitORspec = garch_fit_4b, n.ahead = 1)
+print(forecast_4b)
+```
+
+## Zadanie 5 - Krocząca prognoza
+
+```{r}
+pred_df = data.frame(sgm = NA, series = NA)
+
+n<-nrow(alr_d)-nrow(alr_d_6m)
+   
+for (i in 1:n){
+  pred_df[i,1] = forecast_4b@forecast$sigmaFor[1]
+  pred_df[i,2] = forecast_4b@forecast$seriesFor[1]
+  
+  garch_for = ugarchfit(spec=garch_spec, data=matrix(alr_d$log_rates[(i+2):(125+i)]), solver = "hybrid")
+  forecast_4b = ugarchforecast(fitORspec = garch_for, n.ahead = 1)
+}
+```
+
+```{r echo=FALSE}
+names(alr_d)[1]<-paste("Data_dz")
+
+alr_d_pred = cbind(alr_d[126:nrow(alr_d),], pred_df$sgm, pred_df$series)
+alr_d_pred$Data_dz <- as.Date(alr_d_pred$Data_dz)
+
+alr_d_pred %>% ggplot(aes(x=as.Date(Data_dz)))+
+  geom_line(aes(y = log_rates, col = "Rzeczywiste")) + 
+  geom_line(aes(y = pred_df$series, col = "Prognozowane")) +
+  labs(x = "Dzień", y="Log. stopy zwrotu")
+```
+
+
+Na powyższym wykresie zaprezentowano jak zachowuje się prognoza dla każdego dnia w odniesieniu do wartości rzeczywistej. Co isotne, widoczne są odpowiedzi prognozowanej zmiennej na skoki wartości rzeczywistej, jednakże ich skala jest o wiele mniejsza.
+
+
+## Zadanie 6 - Oszacowanie wartości zagrożonej VaR
+
+W kolejnym etapie wyestymowano wartość VaR zgodnie ze wzorem danym w poleceniu, przymując, że dzienna stopa zwrotu spółki w danym dniu ma rozkład normalny z parametrami równymi prognozom uzyskanym we wcześniejszych etapach.
+```{r}
+z = qnorm(0.95)
+
+alr_d_pred$VaR=NA
+
+names(alr_d_pred)[9]<-paste("sgm")
+names(alr_d_pred)[10]<-paste("series")
+
+
+for (i in 1:nrow(alr_d_pred)){
+  alr_d_pred$VaR[i] = alr_d_pred$Close[i]*(1-exp(alr_d_pred$series[i]+z*alr_d_pred$sgm[i]))
+}
+
+```
+
+```{r echo=FALSE}
+
+alr_d_pred %>% ggplot(aes(x=as.Date(Data_dz)))+ 
+  geom_line(aes(y = VaR, col = "VaR")) +
+  labs(x = "Dzień",y="Wartość")
+```
